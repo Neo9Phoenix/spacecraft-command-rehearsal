@@ -5,7 +5,7 @@ Run from the project folder:  fprime-venv/bin/python -m pytest console/test -v
 
 import pytest
 
-from console.core import (CMD_DISPATCHED, CMD_DONE, CMD_ERROR, COMMANDS, EVIDENCE_TIMEOUT, LINK_TIMEOUT,
+from console.core import (CMD_DISPATCHED, CMD_DONE, CMD_ERROR, COMMANDS, EVIDENCE_TIMEOUT, LINK_TIMEOUT, TIMELINE_LIMIT,
                           MODE_EVENT, MODE_TLM, REJECTED_EVENT, STATE_EVENT, SWITCH_TLM, Busy, Console,
                           ConsoleError, Disconnected)
 
@@ -32,11 +32,13 @@ def env():
 
 
 def ev(console, name, *args):
-    console.on_event({"name": name, "args": list(args), "severity": "ACTIVITY_HI", "text": name, "fsw_time": "t"})
+    console.on_event({"name": name, "args": list(args), "severity": "ACTIVITY_HI", "text": name, "fsw_time": "t",
+                      "fsw_t": console._clock()})
 
 
-def ch(console, name, value):
-    console.on_channel({"name": name, "value": value, "fsw_time": "t"})
+def ch(console, name, value, fsw_t=None):
+    console.on_channel({"name": name, "value": value, "fsw_time": "t",
+                        "fsw_t": console._clock() if fsw_t is None else fsw_t})
 
 
 def last(console):
@@ -261,6 +263,8 @@ def test_step_cannot_advance_until_confirmed(env):
     with pytest.raises(ConsoleError):
         console.advance_scenario()  # nothing sent yet
     console.send_step()
+    written = clock.t  # the switch writes its telemetry while handling the command
+    ev(console, CMD_DISPATCHED, OP["POWER_OFF"], 7)
     ev(console, CMD_DONE, OP["POWER_OFF"])
     with pytest.raises(ConsoleError):
         console.advance_scenario()  # response only, no telemetry yet
@@ -271,8 +275,9 @@ def test_step_cannot_advance_until_confirmed(env):
     assert snap["run"]["step_outcomes"][0] == "unconfirmed"
     with pytest.raises(ConsoleError):
         console.advance_scenario()
-    # Attempt 1's telemetry turns up late, so it has settled and a retry is distinguishable.
-    ch(console, SWITCH_TLM, "OFF")
+    # Attempt 1's telemetry turns up late, so its evidence is accounted for and a retry is distinguishable.
+    ch(console, SWITCH_TLM, "OFF", fsw_t=written)
+    assert console.snapshot()["unresolved"] == []
     assert console.snapshot()["run"]["step_outcomes"][0] == "unconfirmed"  # late evidence never confirms
     # The operator chooses to send again; this attempt gets its evidence.
     console.send_step()
@@ -343,14 +348,17 @@ def test_late_evidence_never_confirms_a_retry(env):
     retry = console.send("POWER_OFF")["id"]
     fsw_power_off(console)  # attempt 1's late answer, indistinguishable from the retry's
     recs = {r["id"]: r for r in console.snapshot()["timeline"]}
-    assert recs[retry]["outcome"] == "unconfirmed"
-    assert recs[retry]["ambiguous_with"] == [first]
-    assert "can't be told apart" in recs[retry]["summary"]
-    assert any(c["label"] == "Evidence belongs to this attempt" and c["ok"] is False for c in recs[retry]["checks"])
+    assert recs[retry]["outcome"] != "confirmed"
+    assert recs[retry]["response"] is None  # the answer went to attempt 1, the oldest unanswered
+    assert [x["name"] for x in recs[first]["late"]].count(CMD_DONE) == 1
     fsw_power_off(console)  # the retry's own answer: shown with the retry, not as foreign activity
     snap = console.snapshot()
+    rec = {r["id"]: r for r in snap["timeline"]}[retry]
+    assert rec["outcome"] == "unconfirmed"
+    assert rec["ambiguous_with"] == [first]
+    assert "can't be told apart" in rec["summary"]
+    assert any(c["label"] == "Evidence belongs to this attempt" and c["ok"] is False for c in rec["checks"])
     assert not [r for r in snap["timeline"] if r["type"] == "activity"]
-    assert {r["id"]: r for r in snap["timeline"]}[retry]["outcome"] == "unconfirmed"
 
 
 def test_retry_confirms_once_the_first_attempt_has_settled(env):
@@ -373,6 +381,10 @@ def test_rehearsal_step_retry_cannot_be_confirmed_by_late_evidence(env):
     time_out(console, clock)
     console.send_step()  # operator chooses Send again
     fsw_power_off(console)  # attempt 1's late answer
+    assert console.snapshot()["run"]["step_outcomes"][0] != "confirmed"
+    with pytest.raises(ConsoleError):
+        console.advance_scenario()
+    fsw_power_off(console)  # the retry's own answer
     assert console.snapshot()["run"]["step_outcomes"][0] == "unconfirmed"
     with pytest.raises(ConsoleError):
         console.advance_scenario()
@@ -394,4 +406,210 @@ def test_interleaved_answers_stay_with_the_retry(env):
     rec = {r["id"]: r for r in snap["timeline"]}[retry]
     assert rec["outcome"] == "unconfirmed"
     assert not [r for r in snap["timeline"] if r["type"] == "activity"]
-    assert [e["name"] for e in rec["events"]].count(CMD_DONE) == 1  # the second answer, kept as evidence
+    assert rec["response"] is not None  # the second answer is the retry's
+    first = rec["ambiguous_with"][0]
+    assert [x["name"] for x in {r["id"]: r for r in snap["timeline"]}[first]["late"]].count(CMD_DONE) == 1
+
+
+
+# ---------------------------------------------------------------- v0.2.1: unresolved attempts
+
+
+DISPATCHED_TLM = "CdhCore.cmdDisp.CommandsDispatched"
+
+
+def test_retry_after_60_s_is_not_confirmed_by_first_attempts_late_evidence(env):
+    """POWER_ON times out unanswered; the operator retries after 60 s; only attempt 1's late
+    response and telemetry arrive. The retry must never show Confirmed."""
+    console, clock, _ = env
+    console.send("POWER_ON")
+    time_out(console, clock)
+    clock.t += 61
+    ch(console, "CommandRehearsal.systemResources.CPU", 1.0)
+    retry = console.send("POWER_ON")["id"]
+    fsw_power_on(console, "NORMAL", "OFF")  # attempt 1's late answer only
+    time_out(console, clock)
+    rec = {r["id"]: r for r in console.snapshot()["timeline"]}[retry]
+    assert rec["outcome"] == "unconfirmed"
+    assert rec["ambiguous_with"]
+
+
+def test_unresolved_attempt_survives_timeline_eviction(env):
+    console, clock, _ = env
+    first = console.send("POWER_ON")["id"]
+    time_out(console, clock)
+    for _ in range(TIMELINE_LIMIT + 5):  # push attempt 1 out of the timeline
+        console.send("SET_MODE", "NORMAL")
+        fsw_set_mode(console, "NORMAL")
+    assert first not in {r["id"] for r in console.snapshot()["timeline"]}
+    console.send("POWER_ON")
+    fsw_power_on(console, "NORMAL", "OFF")  # could be attempt 1's late answer
+    time_out(console, clock)
+    assert last(console)["outcome"] == "unconfirmed"
+    assert last(console)["ambiguous_with"] == [first]
+
+
+def test_same_channel_command_is_also_protected(env):
+    """POWER_OFF reports on the same PayloadSwitch channel as an unresolved POWER_ON."""
+    console, clock, _ = env
+    console.send("POWER_ON")
+    time_out(console, clock)
+    console.send("POWER_OFF")
+    fsw_power_off(console)
+    assert last(console)["outcome"] == "unconfirmed"
+
+
+def test_guard_clears_when_late_evidence_is_accounted_for(env):
+    console, clock, _ = env
+    console.send("POWER_ON")
+    time_out(console, clock)
+    fsw_power_on(console, "NORMAL", "OFF")  # dispatch, response and telemetry, nothing in flight
+    assert console.snapshot()["unresolved"] == []
+    console.send("POWER_ON")
+    fsw_power_on(console, "NORMAL", "OFF")
+    assert last(console)["outcome"] == "confirmed"
+
+
+def test_response_without_telemetry_does_not_clear_the_guard(env):
+    console, clock, _ = env
+    console.send("POWER_ON")
+    time_out(console, clock)
+    ev(console, CMD_DISPATCHED, OP["POWER_ON"], 7)
+    ev(console, CMD_DONE, OP["POWER_ON"])  # late response, but its telemetry never arrives
+    assert len(console.snapshot()["unresolved"]) == 1
+    console.send("POWER_ON")
+    fsw_power_on(console, "NORMAL", "OFF")
+    assert last(console)["outcome"] == "unconfirmed"
+
+
+def test_dispatch_counter_drop_alone_does_not_clear_the_guard(env):
+    console, clock, _ = env
+    ch(console, DISPATCHED_TLM, 5)
+    console.send("POWER_ON")
+    time_out(console, clock)
+    ch(console, DISPATCHED_TLM, 0)  # looks like a restart, but nothing verified the processes changed
+    assert len(console.snapshot()["unresolved"]) == 1
+
+
+def test_link_reconnect_does_not_clear_the_guard(env):
+    console, clock, _ = env
+    console.send("POWER_ON")
+    time_out(console, clock)
+    clock.t += LINK_TIMEOUT + 1
+    console.tick()
+    assert console.snapshot()["link"] == "lost"
+    ch(console, "CommandRehearsal.systemResources.CPU", 1.0)  # link back
+    assert console.snapshot()["link"] == "connected"
+    assert len(console.snapshot()["unresolved"]) == 1
+
+
+class MemoryStore:
+    def __init__(self):
+        self.items = []
+
+    def load(self):
+        return list(self.items)
+
+    def save(self, items):
+        self.items = [dict(i) for i in items]
+
+
+SESSION = {"fsw": "100@Tue Nov 10 00:00:00 2026", "gds": "90@Tue Nov 10 00:00:00 2026"}
+
+
+def make_console(clock, store, session):
+    console = Console(lambda m, a: None, OPCODES, clock=clock, session_probe=lambda: session["now"], store=store)
+    ch(console, "CommandRehearsal.systemResources.CPU", 1.0)
+    return console
+
+
+def unresolved_power_on(clock, store, session):
+    console = make_console(clock, store, session)
+    console.send("POWER_ON")
+    time_out(console, clock)
+    assert len(store.items) == 1
+    return console
+
+
+def test_restarting_only_the_console_keeps_the_guard():
+    """Same running simulator and GDS: a new console process restores the guard, and a retry stays Unconfirmed."""
+    clock, store, session = Clock(), MemoryStore(), {"now": dict(SESSION)}
+    unresolved_power_on(clock, store, session)
+    console = make_console(clock, store, session)  # console restarted, attached to the same GDS
+    snap = console.snapshot()
+    assert [u["label"] for u in snap["unresolved"]] == ["Power on (before console restart)"]
+    assert any(r["type"] == "notice" and r["label"] == "Unresolved attempts restored" for r in snap["timeline"])
+    retry = console.send("POWER_ON")
+    assert retry["ambiguous_with"]
+    fsw_power_on(console, "NORMAL", "OFF")  # attempt 1's late answer
+    fsw_power_on(console, "NORMAL", "OFF")
+    time_out(console, clock)
+    assert {r["id"]: r for r in console.snapshot()["timeline"]}[retry["id"]]["outcome"] == "unconfirmed"
+
+
+def test_console_restart_with_verified_fresh_session_clears_the_guard():
+    clock, store, session = Clock(), MemoryStore(), {"now": dict(SESSION)}
+    unresolved_power_on(clock, store, session)
+    session["now"] = {"fsw": "200@Tue Nov 10 01:00:00 2026", "gds": "190@Tue Nov 10 01:00:00 2026"}
+    console = make_console(clock, store, session)
+    assert console.snapshot()["unresolved"] == []
+    assert store.items == []
+    console.send("POWER_ON")
+    fsw_power_on(console, "NORMAL", "OFF")
+    assert last(console)["outcome"] == "confirmed"
+
+
+def test_fresh_session_detected_while_running_clears_the_guard():
+    clock, store, session = Clock(), MemoryStore(), {"now": dict(SESSION)}
+    console = unresolved_power_on(clock, store, session)
+    session["now"] = {"fsw": "200@Tue Nov 10 01:00:00 2026", "gds": "190@Tue Nov 10 01:00:00 2026"}
+    clock.t += 3
+    ch(console, "CommandRehearsal.systemResources.CPU", 1.0)
+    console.tick()
+    snap = console.snapshot()
+    assert snap["unresolved"] == []
+    assert any(r["type"] == "notice" and r["label"] == "Simulator and GDS restarted" for r in snap["timeline"])
+
+
+@pytest.mark.parametrize("now", [
+    {"fsw": "200@Tue Nov 10 01:00:00 2026", "gds": SESSION["gds"]},  # only the flight software changed
+    {"fsw": SESSION["fsw"], "gds": "190@Tue Nov 10 01:00:00 2026"},  # only the GDS changed
+    None,                                                            # processes can't be identified
+])
+def test_partial_or_unverified_session_change_keeps_the_guard(now):
+    clock, store, session = Clock(), MemoryStore(), {"now": dict(SESSION)}
+    console = unresolved_power_on(clock, store, session)
+    session["now"] = now
+    clock.t += 3
+    ch(console, "CommandRehearsal.systemResources.CPU", 1.0)
+    console.tick()
+    assert len(console.snapshot()["unresolved"]) == 1
+    assert len(make_console(clock, store, session).snapshot()["unresolved"]) == 1  # and across a console restart
+
+
+def test_late_evidence_after_console_restart_is_attributed_and_clears_the_guard():
+    clock, store, session = Clock(), MemoryStore(), {"now": dict(SESSION)}
+    unresolved_power_on(clock, store, session)
+    console = make_console(clock, store, session)
+    fsw_power_on(console, "NORMAL", "OFF")  # attempt 1's late evidence reaches the new console
+    snap = console.snapshot()
+    assert snap["unresolved"] == []
+    assert store.items == []
+    restored = next(r for r in snap["timeline"] if r.get("restored"))
+    assert restored["outcome"] == "unconfirmed"  # late evidence is shown, never confirms
+    assert [x["name"] for x in restored["late"]] == [CMD_DISPATCHED, STATE_EVENT, CMD_DONE, SWITCH_TLM]
+
+
+def test_normal_commands_leave_nothing_unresolved(env):
+    console, _, _ = env
+    console.start_scenario("safe-power-off")
+    run_steps(console, [
+        lambda: fsw_set_mode(console, "NORMAL"),
+        lambda: fsw_power_on(console, "NORMAL", "OFF"),
+        lambda: fsw_set_mode(console, "SAFE"),
+        lambda: fsw_power_off(console),
+    ])
+    snap = console.snapshot()
+    assert snap["unresolved"] == []
+    # A confirmed command's own telemetry is not relabeled as late evidence (seen live in v0.2.0 testing).
+    assert all(r["late"] == [] for r in snap["timeline"] if r["type"] == "command")

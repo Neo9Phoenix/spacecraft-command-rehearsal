@@ -1,19 +1,31 @@
 # Spacecraft Command Rehearsal Lab
 
-A local, simulation-only lab for rehearsing spacecraft commanding with NASA JPL's
-[F´ (F Prime)](https://fprime.jpl.nasa.gov) flight software framework and its ground
-data system (GDS).
+An operator console for rehearsing spacecraft commands against real flight software, run locally as a
+simulation. It sends commands to NASA JPL's [F´ (F Prime)](https://fprime.jpl.nasa.gov) flight software
+through the F´ ground data system (GDS), and shows what the flight software actually did.
 
-**Milestone 1 (this state):**
+What the console demonstrates:
 
-- **Hello World tutorial:** a local F´ deployment built by following the F´
-  [Hello World tutorial](https://fprime.jpl.nasa.gov/latest/tutorials-hello-world/docs/hello-world/).
-- **Payload power switch:** one simulated payload power switch with `NORMAL` and `SAFE` modes.
-- **Integration test:** an automated test that sends the same `POWER_ON` command through the
-  F´ GDS in both modes.
+- **The interlock lives in the flight software.** The console sends Power on in SAFE mode too. F´ rejects it with
+  `OpCodeError(EXECUTION_ERROR)` and a `PowerOnRejected(SAFE)` event, and telemetry shows the payload stays OFF.
+- **Evidence, not assumptions.** A rehearsal step is Confirmed only when the actual command response and the
+  telemetry that follows match the expected result. Missing evidence shows as Unconfirmed, and the operator
+  decides whether to send again.
+- **Honest state.** Flight mode and payload power read Unknown until telemetry reports them, and Last known after
+  the link drops.
 
-Nothing here drives hardware or talks to anything off this machine. The "switch" is a state
-variable inside the flight software, and the flight-software link listens on `127.0.0.1` only.
+![Operator console after the Normal Startup and Safe Mode Rejection rehearsals: flight mode NORMAL, payload power ON, and a timeline of confirmed commands including the rejected Power on in SAFE](docs/operator-console-demo.png)
+
+*The F´ simulator accepts POWER_ON in NORMAL and rejects it in SAFE. Telemetry confirms the payload turns ON in NORMAL and stays OFF in SAFE.*
+
+After [setting up](#set-up) and [building](#build), start it with `scripts/console.sh` and open
+http://127.0.0.1:8765. See [Operator console](#operator-console) for the walkthrough.
+
+Under the console is a local F´ deployment built from the F´
+[Hello World tutorial](https://fprime.jpl.nasa.gov/latest/tutorials-hello-world/docs/hello-world/). It has one
+simulated payload power switch with `NORMAL` and `SAFE` modes, plus unit tests and GDS integration tests. Nothing here
+drives hardware or talks to anything off this machine. The "switch" is a state variable inside the flight software,
+and every listener binds to `127.0.0.1`.
 
 ## What's in the project
 
@@ -50,10 +62,9 @@ The project was tested on macOS 26.6 (Apple silicon) with Apple clang 21. You ne
 
 - **git**, and a **C/C++ compiler** (clang or gcc)
 - **Network access for the first setup:** the F´ submodule, Python packages and a Python build are downloaded once.
-- **Python 3.10 or newer:** F´ v4.4.0 requires it. This Mac only has Python 3.9, so the setup below installs a
-  standalone **Python 3.12.15** into `.tools/` inside the project, using [uv](https://docs.astral.sh/uv/).
-  That needs no admin rights and doesn't touch the system Python. Delete `.tools/` to remove it.
-  If you already have Python 3.10 or newer, you can use it to create `fprime-venv` and skip the `.tools` steps.
+- **Python 3.10 or newer:** F´ v4.4.0 requires it. If you have one, use it directly ([path A](#path-a-existing-python-310-or-newer)).
+  If not, [path B](#path-b-managed-python-with-uv) installs a standalone Python 3.12.15 with
+  [uv](https://docs.astral.sh/uv/). The test Mac had only Python 3.9, so it used path B.
 
 CMake (3.26.0), Ninja, the FPP tools (with their own bundled Java runtime) and the GDS are installed
 by pip into `fprime-venv/` from F´'s pinned `requirements.txt`.
@@ -66,17 +77,38 @@ spaces and quotes in the path.
 
 ## Set up
 
-Run these from the project folder:
+Run these from the project folder. First, fetch F´ v4.4.0 (needed after a fresh clone):
 
 ```sh
-git submodule update --init --recursive   # fetch F´ v4.4.0 (needed after a fresh clone)
+git submodule update --init --recursive
+```
 
-# Project-local Python 3.12.15 (skip if you have Python 3.10 or newer)
+Then create the `fprime-venv` virtual environment with one of the two paths below. Both end with the same
+F´ tools installed, and every later command in this README works the same either way.
+
+### Path A: existing Python 3.10 or newer
+
+```sh
+python3 --version                    # must report 3.10 or newer
+python3 -m venv fprime-venv
+fprime-venv/bin/pip install --upgrade pip
+fprime-venv/bin/pip install -Ur requirements.txt
+```
+
+If `python3` is older but a newer interpreter is installed under another name, such as `python3.12`, use that
+name in place of `python3`.
+
+### Path B: managed Python with uv
+
+This installs a standalone Python 3.12.15 into `.tools/` inside the project. It needs no admin rights and doesn't
+touch the system Python. Any `python3` works for the first line, even 3.9, because it only installs uv.
+Delete `.tools/` to remove it.
+
+```sh
 python3 -m venv .tools/uv-venv
 .tools/uv-venv/bin/pip install "uv==0.13.5"
 UV_PYTHON_INSTALL_DIR=.tools/python .tools/uv-venv/bin/uv python install 3.12.15 --no-bin
 
-# F´ tools in the project's virtual environment
 "$(UV_PYTHON_INSTALL_DIR=.tools/python .tools/uv-venv/bin/uv python find --managed-python 3.12.15)" -m venv fprime-venv
 fprime-venv/bin/pip install --upgrade pip
 fprime-venv/bin/pip install -Ur requirements.txt
@@ -113,10 +145,7 @@ Stop with Ctrl-C.
 ## Operator console
 
 A single-screen operator console for rehearsing the three payload scenarios against the local simulator.
-
-![Operator console after the Normal Startup and Safe Mode Rejection rehearsals: flight mode NORMAL, payload power ON, and a timeline of confirmed commands including the rejected Power on in SAFE](docs/operator-console-demo.png)
-
-*The F´ simulator accepts POWER_ON in NORMAL and rejects it in SAFE. Telemetry confirms the payload turns ON in NORMAL and stays OFF in SAFE.*
+The screenshot at the top of this README shows it.
 
 ### Launch
 
@@ -198,10 +227,22 @@ The Commands panel sends **Power on**, **Power off** and **Set mode** (NORMAL or
   **Activity not sent from this console**. If one lands while a console command is in flight, the two can't be
   told apart.
 - Evidence that arrives after an Unconfirmed command's 10 s window is shown with that command, but never confirms it.
-- If you send a command again while an earlier attempt of it is still Unconfirmed and missing its response or
-  telemetry, the new attempt can't be confirmed either. The earlier attempt's late answer could land during the retry,
-  and F´ can't tell the two apart. The retry stays **Unconfirmed** and says so. Wait until the earlier attempt's late
-  evidence appears in the timeline (or 60 s pass), then send again.
+- **Unresolved attempts:** a command whose evidence hasn't all arrived stays *unresolved*. Its full evidence is its
+  dispatch, its response and its own telemetry sample. While it's unresolved, a new command that repeats it, or that
+  reports on the same telemetry channel, can't be Confirmed. The earlier attempt's late evidence could arrive
+  during the new one, and F´ can't tell them apart: responses carry only the opcode, and telemetry carries no command
+  reference. The Commands panel lists unresolved attempts. One clears only when:
+  - **its late evidence is attributed to it:** its dispatch and response arrive (matched to the oldest unanswered
+    attempt with that opcode), plus a telemetry sample stamped inside that attempt's [dispatch, response] FSW-time
+    interval. The switch writes its telemetry in exactly that interval. Or:
+  - **the simulator and GDS start a verified fresh session:** both the flight-software process and the GDS comm
+    process are positively identified (by process ID and start time) as different from the ones the attempt was
+    sent to. If only one changed, or either can't be identified, the attempt stays unresolved. A drop in the
+    dispatcher's command counter alone doesn't count.
+
+  Nothing else clears it: not time, not the timeline's 200-entry limit, and not a link reconnect. Unresolved attempts
+  are saved to `CommandRehearsal/RehearsalDeployment/logs/console-unresolved.json`. Restarting only the console
+  while it attaches to the same running GDS restores them, and the timeline notes "Unresolved attempts restored".
 
 ## Test
 
@@ -243,14 +284,17 @@ checks after it only see what that one command produced.
 fprime-venv/bin/python -m pytest console/test -v
 ```
 
-These 23 tests check the console's command tracking and rehearsal logic with simulated downlink, no GDS needed:
+These 38 tests check the console's command tracking and rehearsal logic with simulated downlink, no GDS needed:
 - the one-in-flight rule
 - Unknown and Last known readings
 - verdicts: confirmed, unconfirmed and mismatched evidence
-- late evidence, including retries of a timed-out command, which late evidence must never confirm
+- late evidence, including retries of a timed-out command, which late evidence must never confirm, even after
+  60 s, after timeline eviction, or for another command on the same telemetry channel
+- unresolved attempts clearing only when their evidence is attributed or a verified fresh simulator and GDS session
+  starts, and never on a command-counter drop, a link reconnect, a partial restart, or a console-only restart
 - all three scenarios, including the case where F´ wrongly accepts Power on in SAFE
 
-A 24th test, `console/test/test_launcher.py`, runs `scripts/console.sh` with an unrelated process holding port 50000 and
+A 39th test, `console/test/test_launcher.py`, runs `scripts/console.sh` with an unrelated process holding port 50000 and
 checks that it refuses to attach. It is skipped if port 50000 is busy or the deployment isn't built.
 
 ### Integration tests

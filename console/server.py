@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -29,6 +30,10 @@ sys.path.insert(0, str(HERE.parent))
 from console.core import COMMANDS, SCENARIOS, Console, ConsoleError  # noqa: E402
 
 DEPLOYMENT_DIR = HERE.parent / "CommandRehearsal" / "RehearsalDeployment"
+ARTIFACTS = HERE.parent / "build-artifacts" / "Darwin" / "CommandRehearsal_RehearsalDeployment"
+FSW_BINARY = str(ARTIFACTS / "bin" / "CommandRehearsal_RehearsalDeployment")
+DICTIONARY = str(ARTIFACTS / "dict" / "RehearsalDeploymentTopologyDictionary.json")
+UNRESOLVED_FILE = DEPLOYMENT_DIR / "logs" / "console-unresolved.json"
 STATIC = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/index.html": ("index.html", "text/html; charset=utf-8"),
@@ -59,6 +64,59 @@ def _fsw_time(data):
         return data.time.to_readable()
     except Exception:
         return str(data.time)
+
+
+def _fsw_seconds(data):
+    """FSW time as a float, for ordering telemetry against command events; None if unavailable."""
+    try:
+        return float(data.time.seconds) + float(data.time.useconds) / 1e6
+    except Exception:
+        return None
+
+
+def session_probe():
+    """Identify the running flight software and GDS comm process as "pid@start-time" strings.
+
+    Returns {"fsw": ..., "gds": ...} only if exactly one of each is found; otherwise None, which the
+    console treats as "not a verified fresh session". A pid plus its start time is never reused.
+    """
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,lstart=,command="], capture_output=True, text=True,
+                             timeout=5, check=True).stdout
+    except Exception:
+        return None
+    fsw, gds = [], []
+    for line in out.splitlines():
+        parts = line.split(None, 6)  # pid, then lstart's five fields, then the command line
+        if len(parts) < 7:
+            continue
+        ident, command = f"{parts[0]}@{' '.join(parts[1:6])}", parts[6]
+        if command.split(" ", 1)[0] == FSW_BINARY:
+            fsw.append(ident)
+        elif "fprime_gds.executables.comm" in command and DICTIONARY in command:
+            gds.append(ident)
+    if len(fsw) != 1 or len(gds) != 1:
+        return None
+    return {"fsw": fsw[0], "gds": gds[0]}
+
+
+class UnresolvedStore:
+    """Unresolved attempts saved as JSON, so restarting only the console can't drop the retry guard."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+
+    def load(self):
+        if not self.path.exists():
+            return []
+        data = json.loads(self.path.read_text())
+        return data if isinstance(data, list) else []
+
+    def save(self, items):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(items, indent=1))
+        os.replace(tmp, self.path)  # atomic: a crash mid-write never leaves a half-written file
 
 
 def connect_pipeline():
@@ -92,6 +150,7 @@ def attach(console, pipeline):
             "severity": getattr(sev, "name", str(sev)),
             "text": data.get_display_text(),
             "fsw_time": _fsw_time(data),
+            "fsw_t": _fsw_seconds(data),
         }
 
     def channel(data):
@@ -100,6 +159,7 @@ def attach(console, pipeline):
             "name": data.template.get_full_name(),
             "value": _jsonable(getattr(val, "val", val)),
             "fsw_time": _fsw_time(data),
+            "fsw_t": _fsw_seconds(data),
         }
 
     pipeline.coders.register_event_consumer(Consumer(event, console.on_event))
@@ -240,7 +300,7 @@ def main():
         def send(mnemonic, cmd_args):
             pipeline.send_command(mnemonic, cmd_args)
 
-        console = Console(send, opcodes)
+        console = Console(send, opcodes, session_probe=session_probe, store=UnresolvedStore(UNRESOLVED_FILE))
         attach(console, pipeline)
         Handler.console, Handler.port = console, args.port
 
