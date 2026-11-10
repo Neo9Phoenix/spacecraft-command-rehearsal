@@ -26,6 +26,8 @@ def test_launcher_refuses_unrelated_listener_on_fsw_port():
     if not APP.exists():
         pytest.skip("deployment not built")
     squatter = socket.socket()  # an unrelated process (this test) holds the flight-software port
+    # Bind past TIME_WAIT left by a recent GDS run; a live listener on the port still makes bind fail.
+    squatter.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         squatter.bind(("127.0.0.1", 50000))
     except OSError:
