@@ -241,8 +241,10 @@ The Commands panel sends **Power on**, **Power off** and **Set mode** (NORMAL or
     dispatcher's command counter alone doesn't count.
 
   Nothing else clears it: not time, not the timeline's 200-entry limit, and not a link reconnect. Unresolved attempts
-  are saved to `CommandRehearsal/RehearsalDeployment/logs/console-unresolved.json`. Restarting only the console
-  while it attaches to the same running GDS restores them, and the timeline notes "Unresolved attempts restored".
+  are saved to `CommandRehearsal/RehearsalDeployment/logs/console-unresolved.json`. Each command is saved there as
+  unresolved *before* it is dispatched, and if that save fails the command isn't sent, so a crash right after
+  dispatch can't lose the guard. Restarting only the console while it attaches to the same running GDS restores
+  them, and the timeline notes "Unresolved attempts restored".
 
 ## Test
 
@@ -284,7 +286,7 @@ checks after it only see what that one command produced.
 fprime-venv/bin/python -m pytest console/test -v
 ```
 
-These 38 tests check the console's command tracking and rehearsal logic with simulated downlink, no GDS needed:
+These 41 tests check the console's command tracking and rehearsal logic with simulated downlink, no GDS needed:
 - the one-in-flight rule
 - Unknown and Last known readings
 - verdicts: confirmed, unconfirmed and mismatched evidence
@@ -292,9 +294,10 @@ These 38 tests check the console's command tracking and rehearsal logic with sim
   60 s, after timeline eviction, or for another command on the same telemetry channel
 - unresolved attempts clearing only when their evidence is attributed or a verified fresh simulator and GDS session
   starts, and never on a command-counter drop, a link reconnect, a partial restart, or a console-only restart
+- the unresolved state being saved before each command is dispatched, and no command sent if that save fails
 - all three scenarios, including the case where F´ wrongly accepts Power on in SAFE
 
-A 39th test, `console/test/test_launcher.py`, runs `scripts/console.sh` with an unrelated process holding port 50000 and
+A 42nd test, `console/test/test_launcher.py`, runs `scripts/console.sh` with an unrelated process holding port 50000 and
 checks that it refuses to attach. It is skipped if port 50000 is busy or the deployment isn't built.
 
 ### Integration tests

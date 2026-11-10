@@ -613,3 +613,50 @@ def test_normal_commands_leave_nothing_unresolved(env):
     assert snap["unresolved"] == []
     # A confirmed command's own telemetry is not relabeled as late evidence (seen live in v0.2.0 testing).
     assert all(r["late"] == [] for r in snap["timeline"] if r["type"] == "command")
+
+
+def test_unresolved_state_is_saved_before_dispatch():
+    """At the moment the command leaves, the saved state already holds it as unresolved, so a crash
+    between dispatch and any later save can't lose the guard."""
+    clock, store, session = Clock(), MemoryStore(), {"now": dict(SESSION)}
+    seen_at_dispatch = []
+    console = Console(lambda m, a: seen_at_dispatch.append([i["kind"] for i in store.items]), OPCODES,
+                      clock=clock, session_probe=lambda: session["now"], store=store)
+    ch(console, "CommandRehearsal.systemResources.CPU", 1.0)
+    console.send("POWER_ON")
+    assert seen_at_dispatch == [["POWER_ON"]]
+    # Simulated crash right after dispatch: a new console restores the guard from the saved state.
+    restarted = make_console(clock, store, session)
+    assert [u["label"] for u in restarted.snapshot()["unresolved"]] == ["Power on (before console restart)"]
+
+
+def test_command_is_not_sent_if_the_state_cannot_be_saved():
+    class FailingStore(MemoryStore):
+        def save(self, items):
+            raise OSError("disk full")
+
+    sent = []
+    clock = Clock()
+    console = Console(lambda m, a: sent.append(m), OPCODES, clock=clock, session_probe=lambda: dict(SESSION),
+                      store=FailingStore())
+    ch(console, "CommandRehearsal.systemResources.CPU", 1.0)
+    with pytest.raises(ConsoleError):
+        console.send("POWER_ON")
+    assert sent == []
+    assert last(console)["outcome"] == "send_failed"
+    assert console.snapshot()["in_flight"] is None
+
+
+def test_refused_send_is_removed_from_the_saved_state():
+    store = MemoryStore()
+    clock = Clock()
+
+    def refuse(*_):
+        raise RuntimeError("pipeline closed")
+
+    console = Console(refuse, OPCODES, clock=clock, session_probe=lambda: dict(SESSION), store=store)
+    ch(console, "CommandRehearsal.systemResources.CPU", 1.0)
+    with pytest.raises(ConsoleError):
+        console.send("POWER_ON")
+    assert store.items == []
+    assert console.snapshot()["unresolved"] == []

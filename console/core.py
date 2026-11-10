@@ -346,8 +346,9 @@ class Console:
     _SAVED = ("id", "kind", "label", "mnemonic", "opcode", "channel", "sent_at", "session", "acct")
 
     def _persist(self):
+        """Save unresolved attempts. Returns False if the save failed."""
         if self._store is None:
-            return
+            return True
         saved = []
         for r in self.outstanding:  # includes a command in flight: if this process dies, it is unresolved
             item = {k: r.get(k) for k in self._SAVED}
@@ -356,8 +357,9 @@ class Console:
             saved.append(item)
         try:
             self._store.save(saved)
-        except Exception:  # the guard still holds in memory; a failed save must not break commanding
-            pass
+            return True
+        except Exception:
+            return False
 
     def _restore(self):
         """Reload unresolved attempts saved by an earlier console process."""
@@ -483,9 +485,21 @@ class Console:
                 "acct": {"dispatch": None, "response": None, "tlm": None},  # evidence accounting (see _account)
                 "session": self._session_probe(),  # flight-software + GDS processes it was sent to
             }
+            # Write the attempt as unresolved BEFORE dispatching it, so a crash between dispatch and the
+            # save can't lose the guard. If the save fails, the command is not sent at all.
+            self.outstanding.append(rec)
+            if not self._persist():
+                self.outstanding.remove(rec)
+                rec.update(phase="done", outcome="send_failed", completed_at=now,
+                           summary="Command not sent: couldn't save the unresolved-attempt state first.")
+                self._append(rec)
+                self._notify()
+                raise ConsoleError("Command not sent: couldn't save the unresolved-attempt state first.")
             try:
                 self._send(cmd["mnemonic"], args)
-            except Exception as exc:  # pipeline refused it; record that and release the slot
+            except Exception as exc:  # the pipeline refused it, so nothing left: release the slot
+                self.outstanding.remove(rec)
+                self._persist()
                 rec.update(phase="done", outcome="send_failed", completed_at=now,
                            summary=f"Command not sent: {exc}")
                 self._append(rec)
@@ -493,8 +507,6 @@ class Console:
                 raise ConsoleError(f"Command not sent: {exc}") from exc
             self._append(rec)
             self.in_flight = rec
-            self.outstanding.append(rec)
-            self._persist()
             self._notify()
             return copy.deepcopy(rec)
 
