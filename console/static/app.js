@@ -165,11 +165,18 @@ function renderCommands() {
   const modeRadio = (m) => `<input type="radio" name="mode" id="mode-${m}" value="${m}" data-key="mode-${m}" ${ui.mode === m ? "checked" : ""} ${disabled}>
       <label for="mode-${m}">${m}</label>`;
 
+  const unresolved = ui.snap?.unresolved || [];
+  const guard = unresolved.length ? `<div class="guard" role="note">
+      <div class="guard__k">Unresolved: ${unresolved.map((u) => `${esc(u.label)} at <span class="mono">${clock(u.sent_at)}</span>`).join(", ")}</div>
+      <div class="guard__t">Its late evidence can't be told apart from a new attempt. Commands reporting
+        ${esc([...new Set(unresolved.map((u) => u.channel))].join(" or "))}, or repeating that command, stay
+        Unconfirmed until that evidence arrives or the simulator and GDS restart as new processes.</div></div>` : "";
+
   setHTML("commands", `<div class="panel__body">
     <div class="cmd-status ${cls}" role="status" aria-live="polite">
       <div class="cmd-status__label">${esc(label)}</div>
       <div class="cmd-status__text">${esc(text)}</div>
-    </div>
+    </div>${guard}
     <div class="cmd-grid">
       <button class="btn" data-key="POWER_ON" data-cmd="POWER_ON" ${disabled}>Power on<span class="mono">POWER_ON</span></button>
       <button class="btn" data-key="POWER_OFF" data-cmd="POWER_OFF" ${disabled}>Power off<span class="mono">POWER_OFF</span></button>
@@ -309,6 +316,7 @@ function evRow(key, ev, extraCls = "") {
 }
 
 function evidence(rec) {
+  if (rec.type === "notice") return `<div class="ev"><div class="ev__body">${esc(rec.summary)}</div></div>`;
   if (rec.type === "activity") {
     return rec.events.map((e) => evRow(shortName(e.name), e, e.name.endsWith("PowerOnRejected") ? "ev__k--rej" : "")).join("");
   }
@@ -352,8 +360,13 @@ function renderTimeline() {
   }
   setHTML("timeline", items.map((r) => {
     const open = ui.open.has(r.id);
-    const chips = r.type === "activity" ? `<span class="chip chip--warn">Not from console</span>` : responseChip(r) + evidenceChip(r);
-    const head = r.type === "activity"
+    const chips = r.type === "activity" ? `<span class="chip chip--warn">Not from console</span>`
+      : r.type === "notice" ? `<span class="chip chip--warn">Notice</span>` : responseChip(r) + evidenceChip(r);
+    const head = r.type === "notice"
+      ? `<span class="tl__line"><span class="tl__cmd">${esc(r.label)}</span></span>
+         <span class="tl__chips">${chips}</span>
+         <span class="tl__summary">${esc(r.summary)}</span>`
+      : r.type === "activity"
       ? `<span class="tl__line"><span class="tl__cmd">${esc(r.label)}</span></span>
          <span class="tl__chips">${chips}</span>
          <span class="tl__summary">${esc(r.summary)} ${r.events.length} event(s).</span>`

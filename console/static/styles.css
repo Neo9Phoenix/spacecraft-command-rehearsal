@@ -165,6 +165,10 @@ button { font: inherit; color: inherit; }
 .cmd-status--off { border-color: rgba(255, 196, 107, 0.45); }
 .cmd-status--off .cmd-status__text { color: var(--amber); }
 .cmd-status--error .cmd-status__text { color: var(--red); }
+.guard { border: 1px solid rgba(255, 196, 107, 0.45); background: var(--amber-bg); border-radius: 8px;
+  padding: 10px 12px; margin: -6px 0 16px; font-size: 12px; }
+.guard__k { color: var(--amber); font-weight: 600; }
+.guard__t { color: var(--text-2); margin-top: 2px; }
 .cmd-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .cmd-grid .btn { flex-direction: column; gap: 2px; min-height: 58px; }
 .setmode { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border-soft); }

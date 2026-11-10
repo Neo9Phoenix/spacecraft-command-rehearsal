@@ -21,6 +21,7 @@ The SAFE-mode interlock lives in the flight software. Nothing here blocks
 POWER_ON in SAFE; the console sends it and reports what F´ did.
 """
 
+import collections
 import copy
 import itertools
 import threading
@@ -38,7 +39,8 @@ CMD_ERROR = "CdhCore.cmdDisp.OpCodeError"
 
 EVIDENCE_TIMEOUT = 10.0  # seconds; same as the integration tests (telemetry downlinks at 1 Hz)
 LINK_TIMEOUT = 3.0  # seconds without any downlink before the link is shown as lost
-LATE_WINDOW = 60.0  # seconds after sending during which late evidence is attached to an Unconfirmed command
+SAMPLE_BUFFER = 64  # recent PayloadSwitch/PayloadMode samples kept for matching to their command
+SESSION_CHECK = 2.0  # seconds between checks for a verified fresh simulator + GDS session
 TIMELINE_LIMIT = 200
 MODES = ("NORMAL", "SAFE")
 
@@ -158,12 +160,16 @@ class Disconnected(ConsoleError):
 class Console:
     """Thread-safe console state. Feed it with on_event/on_channel; call tick() periodically."""
 
-    def __init__(self, send, opcodes, clock=time.time):
+    def __init__(self, send, opcodes, clock=time.time, session_probe=None, store=None):
         """
         Args:
             send: callable(mnemonic, args) that sends a command through the GDS pipeline
             opcodes: {mnemonic: opcode} for the COMMANDS mnemonics
             clock: wall-clock source (seconds), replaceable in tests
+            session_probe: callable returning {"fsw": id, "gds": id} for the running flight-software and
+                GDS comm processes, or None if they can't both be identified (see server.session_probe)
+            store: object with load() -> list and save(list), persisting unresolved attempts across
+                console restarts (see server.UnresolvedStore)
         """
         self._send = send
         self._opcodes = dict(opcodes)
@@ -183,6 +189,17 @@ class Console:
         self.records = {}
         self.in_flight = None
         self.run = None  # active rehearsal: {"scenario", "step", "attempts": {step: [ids]}, "state"}
+        # Sent commands whose evidence is not yet accounted for, oldest first. Independent of the
+        # timeline, of time and of link reconnects: an attempt leaves only when its evidence is
+        # attributed to it, or when a verified fresh simulator + GDS session starts.
+        self.outstanding = []
+        self._samples = {name: collections.deque(maxlen=SAMPLE_BUFFER) for name in self.telemetry}
+        self._sample_seq = itertools.count(1)
+        self._used_samples = set()
+        self._session_probe = session_probe or (lambda: None)
+        self._store = store
+        self._next_session_check = 0.0
+        self._restore()
 
     # -- helpers ----------------------------------------------------------------
 
@@ -217,28 +234,34 @@ class Console:
             rec = self.in_flight
             if name in (CMD_DISPATCHED, CMD_DONE, CMD_ERROR):
                 opcode = ev["args"][0] if ev.get("args") else None
-                if rec is not None and opcode == rec["opcode"] and rec["response"] is None:
-                    if name == CMD_DISPATCHED:
-                        rec["dispatched"] = rec["dispatched"] or ev
-                    else:
-                        status = "OK" if name == CMD_DONE else str(ev["args"][1])
-                        rec["response"] = {"status": status, "event": ev}
-                    self._advance(rec, now)
-                elif rec is not None and opcode == rec["opcode"]:
-                    # A second answer for this opcode while it is in flight (e.g. a retry's own answer
-                    # after an earlier attempt's late one): keep it with the command as evidence.
-                    rec["events"].append(ev)
-                elif self._late(opcode=opcode, ev=ev, now=now):
-                    pass
-                elif opcode in self._switch_opcodes:
+                field = "dispatch" if name == CMD_DISPATCHED else "response"
+                # F´ answers carry only the opcode, so each answer goes to the oldest attempt of that
+                # opcode still missing one. A retry's first answer may be an earlier attempt's.
+                target = next((r for r in self.outstanding if r["opcode"] == opcode and r["acct"][field] is None),
+                              None)
+                if target is None:
+                    if opcode not in self._switch_opcodes:
+                        return  # another component's command (e.g. SAY_HI from the GDS web UI)
                     self._activity(ev, now)
                 else:
-                    return  # another component's command (e.g. SAY_HI from the GDS web UI)
+                    target["acct"][field] = ev
+                    if target is rec:
+                        if field == "dispatch":
+                            rec["dispatched"] = ev
+                        else:
+                            status = "OK" if name == CMD_DONE else str(ev["args"][1])
+                            rec["response"] = {"status": status, "event": ev}
+                        self._advance(rec, now)
+                    else:
+                        self._note_late(target, ev)
+                    self._account(now)
             elif name.startswith(SWITCH + "."):
                 if rec is not None:
                     rec["events"].append(ev)
                     self._advance(rec, now)
-                elif not self._late(ev=ev, now=now):
+                elif self.outstanding:
+                    self._note_late(self.outstanding[0], ev)
+                else:
                     self._activity(ev, now)
             else:
                 return
@@ -254,45 +277,136 @@ class Console:
             name = ch["name"]
             if name not in self.telemetry:
                 return  # last-telemetry time is computed on the client; no broadcast needed
+            ch["seq"] = next(self._sample_seq)
             self.telemetry[name] = dict(ch, epoch=self.link_epoch)
+            self._samples[name].append(ch)
             rec = self.in_flight
             if rec is not None and rec["channel"] == name and rec["telemetry"] is None:
                 rec["telemetry"] = ch
                 self._advance(rec, now)
-            elif rec is None:
-                self._late(channel=ch, now=now)
+            self._account(now)
             self._notify()
 
-    @staticmethod
-    def _settled(rec):
-        """True once a command's response and telemetry have both arrived, on time or late."""
-        late = rec.get("late", [])
-        responded = rec["response"] is not None or any(x["name"] in (CMD_DONE, CMD_ERROR) for x in late)
-        reported = rec["telemetry"] is not None or any(x["name"] == rec["channel"] for x in late)
-        return responded and reported
+    def _account(self, now):
+        """Match buffered telemetry to outstanding attempts; drop attempts whose evidence is complete.
 
-    def _late(self, now, opcode=None, ev=None, channel=None):
-        """Attach evidence that arrives after an Unconfirmed command's window closed.
-
-        It is shown with that command but never changes its outcome: the operator
-        still decides whether to send again. Returns True if it was attached.
+        The switch writes its telemetry after the dispatcher's OpCodeDispatched and before the
+        command's response, so a sample whose FSW time lies in [dispatch, response] of an attempt
+        is that attempt's write. Oldest attempts are matched first. An attempt is accounted for
+        once its dispatch, response and such a sample have all arrived.
         """
-        rec = next((r for r in reversed(self.timeline) if r["type"] == "command"), None)
-        if rec is None or rec["outcome"] != "unconfirmed" or now - rec["sent_at"] > LATE_WINDOW:
+        for r in list(self.outstanding):
+            acct = r["acct"]
+            if acct["tlm"] is None and acct["dispatch"] is not None and acct["response"] is not None:
+                lo, hi = acct["dispatch"].get("fsw_t"), acct["response"].get("fsw_t")
+                if lo is not None and hi is not None:
+                    for sample in self._samples[r["channel"]]:
+                        t = sample.get("fsw_t")
+                        if t is not None and lo <= t <= hi and sample["seq"] not in self._used_samples:
+                            self._used_samples.add(sample["seq"])
+                            acct["tlm"] = sample
+                            own = r.get("telemetry") is not None and r["telemetry"].get("seq") == sample["seq"]
+                            if r is not self.in_flight and not own:
+                                self._note_late(r, sample)
+                            break
+            if all(acct[k] is not None for k in ("dispatch", "response", "tlm")):
+                self.outstanding.remove(r)
+                self._persist()
+
+    @staticmethod
+    def _fresh_session(sent_in, current):
+        """True only if both the flight software and the GDS comm process are verified to be different
+        processes from those the attempt was sent to. Anything unknown counts as the same session."""
+        if not sent_in or not current:
             return False
-        if channel is not None:
-            # Only the first late sample of the command's own channel is kept.
-            if channel["name"] != rec["channel"] or any(x["name"] == channel["name"] for x in rec["late"]):
-                return False
-            rec["late"].append(channel)
-        else:
-            if opcode is not None and opcode != rec["opcode"]:
-                return False
-            rec["late"].append(ev)
+        return all(sent_in.get(k) and current.get(k) and sent_in[k] != current[k] for k in ("fsw", "gds"))
+
+    def _check_session(self, now):
+        """Clear unresolved attempts whose simulator and GDS have both been replaced."""
+        if not self.outstanding or now < self._next_session_check:
+            return
+        self._next_session_check = now + SESSION_CHECK
+        current = self._session_probe()
+        gone = [r for r in self.outstanding if r is not self.in_flight and self._fresh_session(r["session"], current)]
+        if not gone:
+            return
+        self.outstanding = [r for r in self.outstanding if r not in gone]
+        self.link_epoch += 1  # readings from the old session become "Last known"
+        self._append({
+            "id": next(self._ids), "type": "notice", "label": "Simulator and GDS restarted", "sent_at": now,
+            "summary": (f"Verified fresh session: flight software {current['fsw']} and GDS {current['gds']} are new "
+                        f"processes. Cleared {len(gone)} unresolved attempt(s) "
+                        f"({', '.join(r['label'] for r in gone)}): their late evidence can no longer arrive. "
+                        "Flight mode and payload power are Last known until they report again."),
+        })
+        self._persist()
+        self._notify()
+
+    # Fields kept when an unresolved attempt is saved for a console restart.
+    _SAVED = ("id", "kind", "label", "mnemonic", "opcode", "channel", "sent_at", "session", "acct")
+
+    def _persist(self):
+        """Save unresolved attempts. Returns False if the save failed."""
+        if self._store is None:
+            return True
+        saved = []
+        for r in self.outstanding:  # includes a command in flight: if this process dies, it is unresolved
+            item = {k: r.get(k) for k in self._SAVED}
+            item["acct"] = {k: (None if v is None else {f: v.get(f) for f in ("name", "args", "fsw_t", "fsw_time")})
+                            for k, v in r["acct"].items()}
+            saved.append(item)
+        try:
+            self._store.save(saved)
+            return True
+        except Exception:
+            return False
+
+    def _restore(self):
+        """Reload unresolved attempts saved by an earlier console process."""
+        if self._store is None:
+            return
+        try:
+            saved = self._store.load() or []
+        except Exception:
+            saved = []
+        if not saved:
+            return
+        current = self._session_probe()
+        now = self._clock()
+        kept, cleared = [], []
+        for item in saved:
+            (cleared if self._fresh_session(item.get("session"), current) else kept).append(item)
+        top = max([0] + [int(i.get("id") or 0) for i in saved])
+        self._ids = itertools.count(top + 1)
+        for item in kept:
+            rec = {**item, "type": "command", "label": f"{item['label']} (before console restart)",
+                   "outcome": "unconfirmed", "summary": "Unresolved attempt from before the console restarted.",
+                   "args": [], "origin": None, "expect": {}, "dispatched": None, "response": None, "events": [],
+                   "telemetry": None, "phase": "done", "checks": [], "completed_at": None, "late": [],
+                   "ambiguous_with": [], "ambiguous_labels": [], "restored": True}
+            self.outstanding.append(rec)
+            self._append(rec)  # shown in the timeline so any late evidence for it is visible
+        if kept:
+            self._append({
+                "id": next(self._ids), "type": "notice", "label": "Unresolved attempts restored", "sent_at": now,
+                "summary": (f"Restored {len(kept)} unresolved attempt(s) from before the console restarted "
+                            f"({', '.join(i['label'] for i in kept)}). The simulator and GDS are not verified to be "
+                            "a fresh session, so their late evidence could still arrive."),
+            })
+        if cleared:
+            self._append({
+                "id": next(self._ids), "type": "notice", "label": "Simulator and GDS restarted", "sent_at": now,
+                "summary": (f"Cleared {len(cleared)} saved unresolved attempt(s): the simulator and GDS are verified "
+                            "new processes, so their late evidence can no longer arrive."),
+            })
+        self._persist()
+
+    def _note_late(self, rec, item):
+        """Show evidence that arrived after a command's window with that command. Never changes its outcome."""
+        rec["late"].append(item)
         note = " Late evidence arrived; still Unconfirmed."
-        if not rec["summary"].endswith(note):
+        if rec["outcome"] == "unconfirmed" and not rec["summary"].endswith(note):
             rec["summary"] += note
-        return True
 
     def _activity(self, ev, now):
         """payloadSwitch activity this console did not command (e.g. from the GDS web UI)."""
@@ -316,6 +430,7 @@ class Console:
             if rec is not None and now - rec["sent_at"] > EVIDENCE_TIMEOUT:
                 self._finish(rec, now, timed_out=True)
                 self._notify()
+            self._check_session(now)
 
     # -- commanding -------------------------------------------------------------
 
@@ -336,12 +451,12 @@ class Console:
             args = [mode] if mode else []
             now = self._clock()
             opcode = self._opcodes[cmd["mnemonic"]]
-            # F´ responses carry only the opcode. If an earlier attempt of this command is still
-            # Unconfirmed and unanswered, its late evidence could arrive during this attempt, and the
-            # two can't be told apart. Such an attempt can never be Confirmed.
-            unsettled = [r for r in self.timeline
-                         if r["type"] == "command" and r["opcode"] == opcode and r["outcome"] == "unconfirmed"
-                         and now - r["sent_at"] <= LATE_WINDOW and not self._settled(r)]
+            # F´ responses carry only the opcode and telemetry carries no command reference. While an
+            # earlier attempt with this opcode or this telemetry channel is unresolved, its late evidence
+            # could arrive during this attempt and can't be told apart, so this attempt can never be
+            # Confirmed. No time limit: the guard lasts until that evidence is attributed or a verified
+            # fresh simulator + GDS session starts.
+            unsettled = [r for r in self.outstanding if r["opcode"] == opcode or r["channel"] == cmd["channel"]]
             rec = {
                 "id": next(self._ids),
                 "type": "command",
@@ -366,10 +481,25 @@ class Console:
                 "completed_at": None,
                 "late": [],  # evidence that arrived after the window closed
                 "ambiguous_with": [r["id"] for r in unsettled],  # earlier attempts it can't be told apart from
+                "ambiguous_labels": [r["label"] for r in unsettled],
+                "acct": {"dispatch": None, "response": None, "tlm": None},  # evidence accounting (see _account)
+                "session": self._session_probe(),  # flight-software + GDS processes it was sent to
             }
+            # Write the attempt as unresolved BEFORE dispatching it, so a crash between dispatch and the
+            # save can't lose the guard. If the save fails, the command is not sent at all.
+            self.outstanding.append(rec)
+            if not self._persist():
+                self.outstanding.remove(rec)
+                rec.update(phase="done", outcome="send_failed", completed_at=now,
+                           summary="Command not sent: couldn't save the unresolved-attempt state first.")
+                self._append(rec)
+                self._notify()
+                raise ConsoleError("Command not sent: couldn't save the unresolved-attempt state first.")
             try:
                 self._send(cmd["mnemonic"], args)
-            except Exception as exc:  # pipeline refused it; record that and release the slot
+            except Exception as exc:  # the pipeline refused it, so nothing left: release the slot
+                self.outstanding.remove(rec)
+                self._persist()
                 rec.update(phase="done", outcome="send_failed", completed_at=now,
                            summary=f"Command not sent: {exc}")
                 self._append(rec)
@@ -414,7 +544,7 @@ class Console:
                        "detail": "Not received" if sample is None else f"{sample['value']}"})
         if rec.get("ambiguous_with"):
             checks.append({"label": "Evidence belongs to this attempt", "ok": False,
-                           "detail": f"Can't tell: an earlier {short(rec['mnemonic'])} is still unanswered"})
+                           "detail": f"Can't tell: earlier {', '.join(rec['ambiguous_labels'])} still unresolved"})
         return checks
 
     def _describe(self, rec, waiting=True):
@@ -448,9 +578,10 @@ class Console:
         pending = [c for c in rec["checks"] if c["ok"] is None]
         if rec.get("ambiguous_with"):
             rec["outcome"] = "unconfirmed"
-            rec["summary"] = (f"Unconfirmed. {self._describe(rec, waiting=False)} This can't be told apart from a "
-                              f"late answer to the earlier unanswered {short(rec['mnemonic'])}: F´ responses carry "
-                              "only the opcode. Decide whether to send again.")
+            rec["summary"] = (f"Unconfirmed. {self._describe(rec, waiting=False)} This can't be told apart from late "
+                              f"evidence of the earlier unresolved {', '.join(rec['ambiguous_labels'])}: F´ responses "
+                              "carry only the opcode. That clears when its evidence arrives or the simulator and GDS "
+                              "restart as verified new processes. Decide whether to send again.")
         elif failed:
             rec["outcome"] = "mismatch"
             rec["summary"] = (f"{self._describe(rec, waiting=False)} "
@@ -474,6 +605,8 @@ class Console:
         rec["completed_at"] = now
         if self.in_flight is rec:
             self.in_flight = None
+        if rec in self.outstanding:
+            self._persist()
 
     # -- rehearsals -------------------------------------------------------------
 
@@ -552,7 +685,11 @@ class Console:
                 "last_tlm": self.last_tlm,
                 "telemetry": {"mode": tlm[MODE_TLM], "power": tlm[SWITCH_TLM]},
                 "in_flight": self.in_flight["id"] if self.in_flight else None,
+                "unresolved": [{"id": r["id"], "label": r["label"], "sent_at": r["sent_at"],
+                                "channel": short(r["channel"])}
+                               for r in self.outstanding if r is not self.in_flight],
                 "run": run,
-                "timeline": copy.deepcopy(list(reversed(self.timeline))),
+                "timeline": [{k: v for k, v in r.items() if k not in ("acct", "session")}
+                             for r in copy.deepcopy(list(reversed(self.timeline)))],
                 "limits": {"evidence_timeout": EVIDENCE_TIMEOUT, "link_timeout": LINK_TIMEOUT},
             }
