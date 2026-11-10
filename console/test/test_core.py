@@ -271,6 +271,9 @@ def test_step_cannot_advance_until_confirmed(env):
     assert snap["run"]["step_outcomes"][0] == "unconfirmed"
     with pytest.raises(ConsoleError):
         console.advance_scenario()
+    # Attempt 1's telemetry turns up late, so it has settled and a retry is distinguishable.
+    ch(console, SWITCH_TLM, "OFF")
+    assert console.snapshot()["run"]["step_outcomes"][0] == "unconfirmed"  # late evidence never confirms
     # The operator chooses to send again; this attempt gets its evidence.
     console.send_step()
     fsw_power_off(console)
@@ -320,3 +323,75 @@ def test_late_evidence_stays_with_the_unconfirmed_command(env):
     assert [x["name"] for x in rec["late"]] == [CMD_DISPATCHED, STATE_EVENT, CMD_DONE, SWITCH_TLM]
     assert "Late evidence" in rec["summary"]
     assert console.snapshot()["telemetry"]["power"]["value"] == "OFF"  # the strip still updates
+
+
+# ---------------------------------------------------------------- retries of the same opcode
+
+
+def time_out(console, clock):
+    clock.t += EVIDENCE_TIMEOUT + 0.1
+    ch(console, "CommandRehearsal.systemResources.CPU", 1.0)  # link still alive
+    console.tick()
+
+
+def test_late_evidence_never_confirms_a_retry(env):
+    """Attempt 1 times out unanswered; its late answer lands during the retry. F´ responses carry
+    only the opcode, so the retry can't be told apart from it and must stay Unconfirmed."""
+    console, clock, _ = env
+    first = console.send("POWER_OFF")["id"]
+    time_out(console, clock)
+    retry = console.send("POWER_OFF")["id"]
+    fsw_power_off(console)  # attempt 1's late answer, indistinguishable from the retry's
+    recs = {r["id"]: r for r in console.snapshot()["timeline"]}
+    assert recs[retry]["outcome"] == "unconfirmed"
+    assert recs[retry]["ambiguous_with"] == [first]
+    assert "can't be told apart" in recs[retry]["summary"]
+    assert any(c["label"] == "Evidence belongs to this attempt" and c["ok"] is False for c in recs[retry]["checks"])
+    fsw_power_off(console)  # the retry's own answer: shown with the retry, not as foreign activity
+    snap = console.snapshot()
+    assert not [r for r in snap["timeline"] if r["type"] == "activity"]
+    assert {r["id"]: r for r in snap["timeline"]}[retry]["outcome"] == "unconfirmed"
+
+
+def test_retry_confirms_once_the_first_attempt_has_settled(env):
+    """If attempt 1's late evidence arrives before the retry is sent, the attempts are distinguishable."""
+    console, clock, _ = env
+    console.send("POWER_OFF")
+    time_out(console, clock)
+    fsw_power_off(console)  # late, but before the retry: attached to attempt 1
+    console.send("POWER_OFF")
+    fsw_power_off(console)
+    rec = last(console)
+    assert rec["ambiguous_with"] == []
+    assert rec["outcome"] == "confirmed"
+
+
+def test_rehearsal_step_retry_cannot_be_confirmed_by_late_evidence(env):
+    console, clock, _ = env
+    console.start_scenario("normal-startup")
+    console.send_step()
+    time_out(console, clock)
+    console.send_step()  # operator chooses Send again
+    fsw_power_off(console)  # attempt 1's late answer
+    assert console.snapshot()["run"]["step_outcomes"][0] == "unconfirmed"
+    with pytest.raises(ConsoleError):
+        console.advance_scenario()
+
+
+def test_interleaved_answers_stay_with_the_retry(env):
+    """Seen live: both attempts' answers arrive in one burst before the telemetry. The retry stays
+    Unconfirmed, and its own answer is not mislabeled as another client's activity."""
+    console, clock, _ = env
+    console.send("POWER_OFF")
+    time_out(console, clock)
+    retry = console.send("POWER_OFF")["id"]
+    for _ in range(2):  # attempt 1's answer, then the retry's
+        ev(console, CMD_DISPATCHED, OP["POWER_OFF"], 7)
+        ev(console, STATE_EVENT, "OFF")
+        ev(console, CMD_DONE, OP["POWER_OFF"])
+    ch(console, SWITCH_TLM, "OFF")
+    snap = console.snapshot()
+    rec = {r["id"]: r for r in snap["timeline"]}[retry]
+    assert rec["outcome"] == "unconfirmed"
+    assert not [r for r in snap["timeline"] if r["type"] == "activity"]
+    assert [e["name"] for e in rec["events"]].count(CMD_DONE) == 1  # the second answer, kept as evidence

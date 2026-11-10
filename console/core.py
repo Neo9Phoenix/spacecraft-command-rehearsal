@@ -224,6 +224,10 @@ class Console:
                         status = "OK" if name == CMD_DONE else str(ev["args"][1])
                         rec["response"] = {"status": status, "event": ev}
                     self._advance(rec, now)
+                elif rec is not None and opcode == rec["opcode"]:
+                    # A second answer for this opcode while it is in flight (e.g. a retry's own answer
+                    # after an earlier attempt's late one): keep it with the command as evidence.
+                    rec["events"].append(ev)
                 elif self._late(opcode=opcode, ev=ev, now=now):
                     pass
                 elif opcode in self._switch_opcodes:
@@ -258,6 +262,14 @@ class Console:
             elif rec is None:
                 self._late(channel=ch, now=now)
             self._notify()
+
+    @staticmethod
+    def _settled(rec):
+        """True once a command's response and telemetry have both arrived, on time or late."""
+        late = rec.get("late", [])
+        responded = rec["response"] is not None or any(x["name"] in (CMD_DONE, CMD_ERROR) for x in late)
+        reported = rec["telemetry"] is not None or any(x["name"] == rec["channel"] for x in late)
+        return responded and reported
 
     def _late(self, now, opcode=None, ev=None, channel=None):
         """Attach evidence that arrives after an Unconfirmed command's window closed.
@@ -323,6 +335,13 @@ class Console:
             cmd = COMMANDS[kind]
             args = [mode] if mode else []
             now = self._clock()
+            opcode = self._opcodes[cmd["mnemonic"]]
+            # F´ responses carry only the opcode. If an earlier attempt of this command is still
+            # Unconfirmed and unanswered, its late evidence could arrive during this attempt, and the
+            # two can't be told apart. Such an attempt can never be Confirmed.
+            unsettled = [r for r in self.timeline
+                         if r["type"] == "command" and r["opcode"] == opcode and r["outcome"] == "unconfirmed"
+                         and now - r["sent_at"] <= LATE_WINDOW and not self._settled(r)]
             rec = {
                 "id": next(self._ids),
                 "type": "command",
@@ -330,7 +349,7 @@ class Console:
                 "label": cmd["label"] + (f" {mode}" if mode else ""),
                 "mnemonic": cmd["mnemonic"],
                 "args": args,
-                "opcode": self._opcodes[cmd["mnemonic"]],
+                "opcode": opcode,
                 "channel": cmd["channel"],
                 "origin": origin,
                 "expect": expect or {"response": None, "events": [], "forbid_events": [],
@@ -346,6 +365,7 @@ class Console:
                 "summary": "Command sent. Waiting for response.",
                 "completed_at": None,
                 "late": [],  # evidence that arrived after the window closed
+                "ambiguous_with": [r["id"] for r in unsettled],  # earlier attempts it can't be told apart from
             }
             try:
                 self._send(cmd["mnemonic"], args)
@@ -392,6 +412,9 @@ class Console:
             ok = None if sample is None else str(sample["value"]) == str(tlm["value"])
         checks.append({"label": label, "ok": ok,
                        "detail": "Not received" if sample is None else f"{sample['value']}"})
+        if rec.get("ambiguous_with"):
+            checks.append({"label": "Evidence belongs to this attempt", "ok": False,
+                           "detail": f"Can't tell: an earlier {short(rec['mnemonic'])} is still unanswered"})
         return checks
 
     def _describe(self, rec, waiting=True):
@@ -423,7 +446,12 @@ class Console:
         rec["checks"] = self._checks(rec)
         failed = [c for c in rec["checks"] if c["ok"] is False]
         pending = [c for c in rec["checks"] if c["ok"] is None]
-        if failed:
+        if rec.get("ambiguous_with"):
+            rec["outcome"] = "unconfirmed"
+            rec["summary"] = (f"Unconfirmed. {self._describe(rec, waiting=False)} This can't be told apart from a "
+                              f"late answer to the earlier unanswered {short(rec['mnemonic'])}: F´ responses carry "
+                              "only the opcode. Decide whether to send again.")
+        elif failed:
             rec["outcome"] = "mismatch"
             rec["summary"] = (f"{self._describe(rec, waiting=False)} "
                               f"Did not match the expected result: {failed[0]['label']}.")

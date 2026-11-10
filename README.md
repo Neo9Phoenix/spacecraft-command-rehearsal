@@ -126,8 +126,9 @@ Then open **http://127.0.0.1:8765** in a browser. Stop with Ctrl-C. That also st
 if the script started them.
 
 The script activates `fprime-venv` itself. It starts `fprime-gds -g none` from `CommandRehearsal/RehearsalDeployment`
-(log: `logs/console-gds.log` there), waits for the flight software to connect, then starts the adapter. If an
-`fprime-gds` is already running (TCP port 50000 in use), the console attaches to it instead of starting another.
+(log: `logs/console-gds.log` there), waits for the flight software to connect, then starts the adapter. If this
+project's `fprime-gds` is already running on TCP port 50000, the console attaches to it instead of starting another.
+If any other process holds port 50000, the script refuses to attach, names that process, and exits with status 2.
 Use `scripts/console.sh --port 9000` for a different port. Stop the console before running
 `scripts/integration-test.sh`, because both need port 50000.
 
@@ -193,6 +194,10 @@ The Commands panel sends **Power on**, **Power off** and **Set mode** (NORMAL or
   **Activity not sent from this console**. If one lands while a console command is in flight, the two can't be
   told apart.
 - Evidence that arrives after an Unconfirmed command's 10 s window is shown with that command, but never confirms it.
+- If you send a command again while an earlier attempt of it is still Unconfirmed and missing its response or
+  telemetry, the new attempt can't be confirmed either. The earlier attempt's late answer could land during the retry,
+  and F´ can't tell the two apart. The retry stays **Unconfirmed** and says so. Wait until the earlier attempt's late
+  evidence appears in the timeline (or 60 s pass), then send again.
 
 ## Test
 
@@ -234,12 +239,15 @@ checks after it only see what that one command produced.
 fprime-venv/bin/python -m pytest console/test -v
 ```
 
-These 19 tests check the console's command tracking and rehearsal logic with simulated downlink, no GDS needed:
+These 23 tests check the console's command tracking and rehearsal logic with simulated downlink, no GDS needed:
 - the one-in-flight rule
 - Unknown and Last known readings
 - verdicts: confirmed, unconfirmed and mismatched evidence
-- late evidence
+- late evidence, including retries of a timed-out command, which late evidence must never confirm
 - all three scenarios, including the case where F´ wrongly accepts Power on in SAFE
+
+A 24th test, `console/test/test_launcher.py`, runs `scripts/console.sh` with an unrelated process holding port 50000 and
+checks that it refuses to attach. It is skipped if port 50000 is busy or the deployment isn't built.
 
 ### Integration tests
 
