@@ -14,3 +14,11 @@ build-fprime-*
 /.vscode/
 .DS_Store
 *.gcov
+
+# Project-local Python interpreter (installed by uv; see README)
+/.tools/
+
+# Python bytecode and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
