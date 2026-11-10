@@ -114,6 +114,10 @@ Stop with Ctrl-C.
 
 A single-screen operator console for rehearsing the three payload scenarios against the local simulator.
 
+![Operator console after the Normal Startup and Safe Mode Rejection rehearsals: flight mode NORMAL, payload power ON, and a timeline of confirmed commands including the rejected Power on in SAFE](docs/operator-console-demo.png)
+
+*The F´ simulator accepts POWER_ON in NORMAL and rejects it in SAFE. Telemetry confirms the payload turns ON in NORMAL and stays OFF in SAFE.*
+
 ### Launch
 
 From the project folder, after building:
