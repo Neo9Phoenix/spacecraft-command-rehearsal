@@ -23,6 +23,7 @@ variable inside the flight software, and the flight-software link listens on `12
 | `CommandRehearsal/Components/HiComponent/` | The tutorial's component: the `SAY_HI` command, `SayHiEvent` event and `GreetingCount` channel, exactly as the tutorial writes it |
 | `CommandRehearsal/Components/PayloadPowerSwitch/` | The simulated payload power switch (see below) |
 | `CommandRehearsal/RehearsalDeployment/` | The deployment: the tutorial's standard command and data handling topology plus `hiCmpntInstance` (base id `0x10005000`) and `payloadSwitch` (base id `0x10006000`) |
+| `CommandRehearsal/Components/PayloadPowerSwitch/test/ut/` | The switch's unit tests (F´ Google Test harness) |
 | `CommandRehearsal/RehearsalDeployment/test/int/` | The pytest integration tests, run through the F´ GDS |
 | `scripts/integration-test.sh` | Starts the deployment and GDS headless, runs the integration tests, then stops everything |
 
@@ -32,9 +33,14 @@ The switch is an active F´ component. It starts **OFF** in **NORMAL** mode.
 
 | Command | NORMAL mode | SAFE mode |
 |---|---|---|
-| `CommandRehearsal.payloadSwitch.POWER_ON` | Switch turns **ON**. `SwitchStateChanged(ON)` event, `PayloadSwitch = ON` telemetry. Command completes `OK`. | **Rejected.** `PowerOnRejected(SAFE)` warning event. The command fails with `EXECUTION_ERROR`, so the dispatcher emits `CdhCore.cmdDisp.OpCodeError(…, EXECUTION_ERROR)`. The switch does not move, and `PayloadSwitch = OFF` telemetry is sent so the ground can confirm it. |
+| `CommandRehearsal.payloadSwitch.POWER_ON` | Switch turns **ON**. `SwitchStateChanged(ON)` event, `PayloadSwitch = ON` telemetry. Command completes `OK`. | **Rejected.** `PowerOnRejected(SAFE)` warning event. The command fails with `EXECUTION_ERROR`, so the dispatcher emits `CdhCore.cmdDisp.OpCodeError(…, EXECUTION_ERROR)`. The switch does not move. Its unchanged position is sent as `PayloadSwitch` telemetry so the ground can confirm it: `OFF` if it was off, `ON` if it was already on. |
 | `CommandRehearsal.payloadSwitch.POWER_OFF` | Switch turns **OFF** (`SwitchStateChanged(OFF)`, `PayloadSwitch = OFF`) | The same. Turning the payload off is always allowed. |
 | `CommandRehearsal.payloadSwitch.SET_MODE(newMode)` | Sets `NORMAL` or `SAFE` (`ModeChanged`, `PayloadMode` telemetry). The switch never moves. | The same |
+
+**Entering SAFE blocks future `POWER_ON` commands, but it does not turn off a payload that is already powered.**
+If the switch is ON when `SET_MODE(SAFE)` is sent, it stays ON. Every `POWER_ON` after that is rejected,
+and the switch stays ON until a `POWER_OFF` is sent, which SAFE mode allows. The unit tests
+`Safe.PowerOnInSafeLeavesOnSwitchUnchanged` and `Mode.SetModeDoesNotMoveSwitch` check this.
 
 ## Requirements
 
@@ -103,6 +109,40 @@ This starts the flight software and the GDS, and opens http://127.0.0.1:5000:
 Stop with Ctrl-C.
 
 ## Test
+
+There are two kinds of tests:
+
+- **Unit tests** check the switch component on its own, in-process, without the GDS.
+- **Integration tests** run the whole deployment and send commands through the F´ ground system.
+
+### Unit tests
+
+```sh
+source fprime-venv/bin/activate
+fprime-util generate --ut   # once, creates build-fprime-automatic-native-ut/
+fprime-util check --all     # builds and runs every unit test in the project
+```
+
+F´'s own framework unit tests are switched off in `settings.ini`, so `check --all` builds and runs only
+`PayloadPowerSwitch`'s 8 tests, in about 15 s on an M-series Mac. To run just this component, use
+`cd CommandRehearsal/Components/PayloadPowerSwitch && fprime-util check`.
+
+Each test builds a new component, so it starts from the real initial state: switch OFF, NORMAL mode.
+Each command helper clears the recorded events, telemetry and command responses before sending, so the
+checks after it only see what that one command produced.
+
+| Test | Checks |
+|---|---|
+| `Nominal.PowerOnInNormalTurnsSwitchOn` | `POWER_ON` responds OK. The only event is `SwitchStateChanged(ON)`, and the only telemetry is `PayloadSwitch = ON`. |
+| `Nominal.PowerOffWhenAlreadyOff` | `POWER_OFF` on an OFF switch succeeds, and still reports OFF |
+| `Safe.PowerOnInSafeIsRejectedAndSwitchStaysOff` | In SAFE, `POWER_ON` responds `EXECUTION_ERROR`. The only event is `PowerOnRejected(SAFE)`, with no `SwitchStateChanged`, and the telemetry reports `PayloadSwitch = OFF`. |
+| `Safe.PowerOnInSafeLeavesOnSwitchUnchanged` | If the switch was already ON when SAFE was set, a rejected `POWER_ON` leaves it ON, and it's reported as ON |
+| `Safe.PowerOffAllowedInSafe` | In SAFE, `POWER_OFF` still works: OK, `SwitchStateChanged(OFF)`, `PayloadSwitch = OFF` |
+| `Mode.SetModeDoesNotMoveSwitch` | `SET_MODE` to SAFE and back to NORMAL emits `ModeChanged` and `PayloadMode` telemetry, but no switch event or switch telemetry |
+| `Mode.ReturnToNormalAllowsPowerOn` | After a rejection in SAFE and a return to NORMAL, `POWER_ON` works again |
+| `OffNominal.InvalidModeIsRejected` | A hand-encoded `SET_MODE` with mode value 99 responds `FORMAT_ERROR`, with no event or telemetry. The mode stays NORMAL, so `POWER_ON` still works. |
+
+### Integration tests
 
 ```sh
 scripts/integration-test.sh
