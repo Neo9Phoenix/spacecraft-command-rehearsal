@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Command Rehearsal Console</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="masthead">
+    <div class="masthead__title">
+      <h1>Spacecraft Command Rehearsal</h1>
+      <span class="sim-label" title="Local F´ simulator. No hardware is commanded.">
+        <span class="sim-label__key">Simulation</span>
+        <span class="sim-label__note">Local F´ simulator · no hardware</span>
+      </span>
+    </div>
+    <div class="link" id="link" role="status" aria-live="polite"></div>
+  </header>
+
+  <section class="strip" id="strip" aria-label="Spacecraft state"></section>
+
+  <main class="workspace">
+    <section class="panel panel--commands" aria-labelledby="cmd-h">
+      <div class="panel__head"><h2 id="cmd-h">Commands</h2><span class="panel__meta">payloadSwitch</span></div>
+      <div id="commands"></div>
+    </section>
+
+    <section class="panel panel--rehearsal" aria-labelledby="reh-h">
+      <div class="panel__head"><h2 id="reh-h">Rehearsal</h2><span class="panel__meta" id="reh-meta"></span></div>
+      <div id="rehearsal"></div>
+    </section>
+
+    <section class="panel panel--timeline" aria-labelledby="tl-h">
+      <div class="panel__head"><h2 id="tl-h">Timeline</h2><span class="panel__meta">Newest first · ground time</span></div>
+      <ol class="timeline" id="timeline"></ol>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
