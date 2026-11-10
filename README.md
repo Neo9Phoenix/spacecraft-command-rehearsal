@@ -26,6 +26,8 @@ variable inside the flight software, and the flight-software link listens on `12
 | `CommandRehearsal/Components/PayloadPowerSwitch/test/ut/` | The switch's unit tests (F´ Google Test harness) |
 | `CommandRehearsal/RehearsalDeployment/test/int/` | The pytest integration tests, run through the F´ GDS |
 | `scripts/integration-test.sh` | Starts the deployment and GDS headless, runs the integration tests, then stops everything |
+| `console/` | The operator console: a small Python adapter (`server.py`, `core.py`) and a browser page (`static/`) |
+| `scripts/console.sh` | Starts the deployment and GDS headless, then the operator console on http://127.0.0.1:8765 |
 
 ## The payload power switch
 
@@ -108,6 +110,95 @@ This starts the flight software and the GDS, and opens http://127.0.0.1:5000:
 
 Stop with Ctrl-C.
 
+## Operator console
+
+A single-screen operator console for rehearsing the three payload scenarios against the local simulator.
+
+### Launch
+
+From the project folder, after building:
+
+```sh
+scripts/console.sh
+```
+
+Then open **http://127.0.0.1:8765** in a browser. Stop with Ctrl-C. That also stops the flight software and GDS
+if the script started them.
+
+The script activates `fprime-venv` itself. It starts `fprime-gds -g none` from `CommandRehearsal/RehearsalDeployment`
+(log: `logs/console-gds.log` there), waits for the flight software to connect, then starts the adapter. If this
+project's `fprime-gds` is already running on TCP port 50000, the console attaches to it instead of starting another.
+If any other process holds port 50000, the script refuses to attach, names that process, and exits with status 2.
+Use `scripts/console.sh --port 9000` for a different port. Stop the console before running
+`scripts/integration-test.sh`, because both need port 50000.
+
+### How it connects
+
+`console/server.py` connects to the running GDS the same way the integration tests' `fprime_test_api` fixture does:
+`ConfigDrivenParser` with `StandardPipelineParser.pipeline_factory`, reading `fprime-gds.yml` from the deployment folder.
+It sends commands with `pipeline.send_command`, which is what `IntegrationTestAPI.send_command` calls. It reads events
+and telemetry from the same pipeline decoders. A command's response is the dispatcher's `OpCodeCompleted` or
+`OpCodeError` event, matched by opcode, as `send_and_assert_command` does.
+
+- **Local only:** the HTTP server binds to `127.0.0.1`. It answers only requests addressed to `127.0.0.1` or
+  `localhost` on its port, and accepts commands only as same-origin JSON.
+- **The interlock stays in F´:** the console sends `POWER_ON` in SAFE mode too, so the timeline shows the flight
+  software's actual rejection.
+- **One command in flight:** a command stays in flight until its evidence is complete or 10 s pass. The other
+  command buttons are disabled meanwhile, and the adapter refuses a second command with HTTP 409.
+- **Link status:** the GDS link shows as connected while any telemetry arrives. The deployment downlinks
+  `systemResources` every second. After 3 s with no downlink, the link shows as lost and commands are disabled.
+- **Readings:** flight mode and payload power come only from `PayloadMode` and `PayloadSwitch` telemetry.
+  The switch reports these only after a command, so both read **Unknown** until you send one.
+  If the link drops, the last values stay on screen tagged **Last known**, until fresh telemetry replaces them.
+
+### Walkthrough
+
+1. **Check the header.** **Simulation** is always shown. The link indicator should read **GDS connected**, with the
+   downlink age ticking. **Flight mode** and **Payload power** read **Unknown** on a fresh start.
+2. **Pick a rehearsal** in the Rehearsal panel and press **Start**. The panel shows the scenario's starting
+   conditions, compared live against telemetry, and its steps. Setup steps put the simulator into the starting
+   conditions with real commands.
+3. **Send each step.** The current step shows the **next action** and the **expected outcome**. Press **Send …**. The
+   step waits for the command response and the telemetry that follows. It's marked **Confirmed** only when both match
+   the expected result. Press **Continue to next step** to advance.
+4. **If evidence doesn't arrive within 10 s,** the step is **Unconfirmed**, and nothing is resent automatically.
+   Check the timeline, then choose **Send again** or **Stop rehearsal**. If the result contradicts the expectation,
+   the step shows **Did not match** and also can't advance.
+5. **Inspect the timeline.** Every command gets an entry with its ground time, a **Response** label (Accepted or
+   Rejected) and an **Evidence** label (Confirmed, Unconfirmed or Did not match). Click an entry to see the evidence:
+   - the command sent, with its opcode
+   - the dispatch event
+   - the actual response event
+   - any rejection event
+   - the resulting telemetry, with FSW and ground timestamps
+   - each expected-result check
+
+The three rehearsals:
+
+| Scenario | Starting conditions | Final step | Expected outcome |
+|---|---|---|---|
+| **Normal Startup** | NORMAL, payload OFF | Power on | Accepted, `SwitchStateChanged(ON)`, telemetry shows **ON** |
+| **Safe Mode Rejection** | SAFE, payload OFF | Power on | Rejected: `OpCodeError(EXECUTION_ERROR)` and `PowerOnRejected(SAFE)`, telemetry still shows **OFF** |
+| **Power Off in Safe Mode** | SAFE, payload ON | Power off | Accepted, `SwitchStateChanged(OFF)`, telemetry shows **OFF** |
+
+**Power Off in Safe Mode** reaches its starting point by powering on in NORMAL, then entering SAFE. The SAFE step
+checks that no `SwitchStateChanged` event appears, so the payload stays ON. Power off is then sent in SAFE.
+
+The Commands panel sends **Power on**, **Power off** and **Set mode** (NORMAL or SAFE) by hand, under the same rules.
+
+**Known limits:**
+- The dispatcher's response events carry no sequence number, so the console matches responses by opcode, one
+  command at a time.
+- Commands sent from another GDS client, such as the GDS web UI, appear in the timeline as
+  **Activity not sent from this console**. If one lands while a console command is in flight, the two can't be
+  told apart.
+- Evidence that arrives after an Unconfirmed command's 10 s window is shown with that command, but never confirms it.
+- If you send a command again while an earlier attempt of it is still Unconfirmed and missing its response or
+  telemetry, the new attempt can't be confirmed either. The earlier attempt's late answer could land during the retry,
+  and F´ can't tell the two apart. The retry stays **Unconfirmed** and says so. Wait until the earlier attempt's late
+  evidence appears in the timeline (or 60 s pass), then send again.
+
 ## Test
 
 There are two kinds of tests:
@@ -141,6 +232,22 @@ checks after it only see what that one command produced.
 | `Mode.SetModeDoesNotMoveSwitch` | `SET_MODE` to SAFE and back to NORMAL emits `ModeChanged` and `PayloadMode` telemetry, but no switch event or switch telemetry |
 | `Mode.ReturnToNormalAllowsPowerOn` | After a rejection in SAFE and a return to NORMAL, `POWER_ON` works again |
 | `OffNominal.InvalidModeIsRejected` | A hand-encoded `SET_MODE` with mode value 99 responds `FORMAT_ERROR`, with no event or telemetry. The mode stays NORMAL, so `POWER_ON` still works. |
+
+### Console tests
+
+```sh
+fprime-venv/bin/python -m pytest console/test -v
+```
+
+These 23 tests check the console's command tracking and rehearsal logic with simulated downlink, no GDS needed:
+- the one-in-flight rule
+- Unknown and Last known readings
+- verdicts: confirmed, unconfirmed and mismatched evidence
+- late evidence, including retries of a timed-out command, which late evidence must never confirm
+- all three scenarios, including the case where F´ wrongly accepts Power on in SAFE
+
+A 24th test, `console/test/test_launcher.py`, runs `scripts/console.sh` with an unrelated process holding port 50000 and
+checks that it refuses to attach. It is skipped if port 50000 is busy or the deployment isn't built.
 
 ### Integration tests
 
